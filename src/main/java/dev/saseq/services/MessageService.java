@@ -1,5 +1,10 @@
 package dev.saseq.services;
 
+import dev.saseq.models.DiscordEmbed;
+import dev.saseq.models.DiscordMessage;
+import dev.saseq.models.MessageResult;
+import dev.saseq.security.AttachmentPathPolicy;
+import jakarta.annotation.PreDestroy;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.channel.concrete.NewsChannel;
@@ -7,20 +12,32 @@ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.entities.emoji.Emoji;
+import net.dv8tion.jda.api.utils.FileUpload;
+import net.dv8tion.jda.api.utils.messages.MessageCreateBuilder;
+import net.dv8tion.jda.api.utils.messages.MessageEditBuilder;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Path;
 import java.util.List;
 
 @Service
 public class MessageService {
 
     private final JDA jda;
+    private final AttachmentPathPolicy attachmentPathPolicy;
 
-    public MessageService(JDA jda) {
+    public MessageService(JDA jda,
+                          @Value("${discord.attachments-root:${DISCORD_ATTACHMENTS_ROOT:/home/hermes/agents/shared_vault/receipts/blobs}}") String attachmentsRoot) {
         this.jda = jda;
+        this.attachmentPathPolicy = new AttachmentPathPolicy(Path.of(attachmentsRoot));
+    }
+
+    @PreDestroy
+    void closeAttachmentPathPolicy() {
+        attachmentPathPolicy.close();
     }
 
     /**
@@ -45,6 +62,32 @@ public class MessageService {
         return null;
     }
 
+    private List<AttachmentPathPolicy.ApprovedAttachment> openAttachments(List<String> files) {
+        if (files == null || files.isEmpty()) {
+            return List.of();
+        }
+        java.util.ArrayList<AttachmentPathPolicy.ApprovedAttachment> approved = new java.util.ArrayList<>();
+        try {
+            for (String file : files) {
+                approved.add(attachmentPathPolicy.open(file));
+            }
+            return approved;
+        } catch (RuntimeException ex) {
+            closeAttachments(approved);
+            throw ex;
+        }
+    }
+
+    private void closeAttachments(List<AttachmentPathPolicy.ApprovedAttachment> attachments) {
+        for (AttachmentPathPolicy.ApprovedAttachment attachment : attachments) {
+            try {
+                attachment.close();
+            } catch (Exception ignored) {
+                // Preserve the send or validation error that triggered cleanup.
+            }
+        }
+    }
+
     /**
      * Sends a message to a specified Discord channel.
      *
@@ -53,21 +96,44 @@ public class MessageService {
      * @return A confirmation message with a link to the sent message.
      */
     @Tool(name = "send_message", description = "Send a message to a specific channel")
-    public String sendMessage(@ToolParam(description = "Discord channel ID") String channelId,
-                              @ToolParam(description = "Message content") String message) {
+    public MessageResult sendMessage(@ToolParam(description = "Discord channel ID") String channelId,
+                                     @ToolParam(description = "Plain text message content", required = false) String content,
+                                     @ToolParam(description = "Discord embeds using the shared full embed schema", required = false) List<DiscordEmbed> embeds,
+                                     @ToolParam(description = "Absolute file paths under the configured receipt blobs root", required = false) List<String> files) {
         if (channelId == null || channelId.isEmpty()) {
             throw new IllegalArgumentException("channelId cannot be null");
         }
-        if (message == null || message.isEmpty()) {
-            throw new IllegalArgumentException("message cannot be null");
+        boolean hasContent = content != null && !content.isEmpty();
+        boolean hasEmbeds = embeds != null && !embeds.isEmpty();
+        boolean hasFiles = files != null && !files.isEmpty();
+        if (!hasContent && !hasEmbeds && !hasFiles) {
+            throw new IllegalArgumentException("At least one of content, embeds, or files must be provided");
         }
 
-        MessageChannel channel = getMessageChannelById(channelId);
-        if (channel == null) {
-            throw new IllegalArgumentException("Channel not found by channelId");
+        List<AttachmentPathPolicy.ApprovedAttachment> approvedFiles = openAttachments(files);
+
+        try {
+            MessageChannel channel = getMessageChannelById(channelId);
+            if (channel == null) {
+                throw new IllegalArgumentException("Channel not found by channelId");
+            }
+            MessageCreateBuilder payload = new MessageCreateBuilder();
+            if (content != null) {
+                payload.setContent(content);
+            }
+            if (embeds != null) {
+                payload.addEmbeds(embeds.stream().map(DiscordEmbed::toMessageEmbed).toList());
+            }
+            if (!approvedFiles.isEmpty()) {
+                payload.setFiles(approvedFiles.stream()
+                        .map(attachment -> FileUpload.fromData(attachment.stream(), attachment.filename()))
+                        .toList());
+            }
+            Message sentMessage = channel.sendMessage(payload.build()).complete();
+            return new MessageResult(sentMessage.getId(), sentMessage.getChannelId());
+        } finally {
+            closeAttachments(approvedFiles);
         }
-        Message sentMessage = channel.sendMessage(message).complete();
-        return "Message sent successfully. Message link: " + sentMessage.getJumpUrl();
     }
 
     /**
@@ -79,17 +145,18 @@ public class MessageService {
      * @return A confirmation message with a link to the edited message.
      */
     @Tool(name = "edit_message", description = "Edit a message from a specific channel")
-    public String editMessage(@ToolParam(description = "Discord channel ID") String channelId,
-                              @ToolParam(description = "Specific message ID") String messageId,
-                              @ToolParam(description = "New message content") String newMessage) {
+    public MessageResult editMessage(@ToolParam(description = "Discord channel ID") String channelId,
+                                     @ToolParam(description = "Specific message ID") String messageId,
+                                     @ToolParam(description = "New plain text content", required = false) String content,
+                                     @ToolParam(description = "Replacement Discord embeds using the shared full embed schema", required = false) List<DiscordEmbed> embeds) {
         if (channelId == null || channelId.isEmpty()) {
             throw new IllegalArgumentException("channelId cannot be null");
         }
         if (messageId == null || messageId.isEmpty()) {
             throw new IllegalArgumentException("messageId cannot be null");
         }
-        if (newMessage == null || newMessage.isEmpty()) {
-            throw new IllegalArgumentException("newMessage cannot be null");
+        if (content == null && embeds == null) {
+            throw new IllegalArgumentException("At least one of content or embeds must be provided");
         }
 
         MessageChannel channel = getMessageChannelById(channelId);
@@ -100,8 +167,15 @@ public class MessageService {
         if (messageById == null) {
             throw new IllegalArgumentException("Message not found by messageId");
         }
-        Message editedMessage = messageById.editMessage(newMessage).complete();
-        return "Message edited successfully. Message link: " + editedMessage.getJumpUrl();
+        MessageEditBuilder payload = new MessageEditBuilder();
+        if (content != null) {
+            payload.setContent(content);
+        }
+        if (embeds != null) {
+            payload.setEmbeds(embeds.stream().map(DiscordEmbed::toMessageEmbed).toList());
+        }
+        Message editedMessage = messageById.editMessage(payload.build()).complete();
+        return new MessageResult(editedMessage.getId(), editedMessage.getChannelId());
     }
 
     /**
@@ -144,11 +218,12 @@ public class MessageService {
      * @return A formatted string containing the retrieved messages.
      */
     @Tool(name = "read_messages", description = "Read message history from a specific channel, optionally paginated with before/after/around")
-    public String readMessages(@ToolParam(description = "Discord channel ID") String channelId,
+    public Object readMessages(@ToolParam(description = "Discord channel ID") String channelId,
                                @ToolParam(description = "Number of messages to retrieve (1-100)", required = false) String count,
                                @ToolParam(description = "Message ID to fetch messages before this message", required = false) String before,
                                @ToolParam(description = "Message ID to fetch messages after this message", required = false) String after,
-                               @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around) {
+                               @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around,
+                               @ToolParam(description = "Return structured message objects; defaults to the legacy byte-for-byte text format", required = false) Boolean structured) {
         if (channelId == null || channelId.isEmpty()) {
             throw new IllegalArgumentException("channelId cannot be null");
         }
@@ -168,6 +243,9 @@ public class MessageService {
             messages = channel.getHistoryAround(around, limit).complete().getRetrievedHistory();
         } else {
             messages = channel.getHistory().retrievePast(limit).complete();
+        }
+        if (Boolean.TRUE.equals(structured)) {
+            return messages.stream().map(this::toStructuredMessage).toList();
         }
         List<String> formatedMessages = formatMessages(messages);
         return "**Retrieved " + messages.size() + " messages:** \n" + String.join("\n", formatedMessages);
@@ -350,6 +428,28 @@ public class MessageService {
                 formatFileSize(attachment.getSize()),
                 attachment.getContentType() != null ? attachment.getContentType() : "unknown",
                 attachment.getUrl()
+        );
+    }
+
+    private DiscordMessage toStructuredMessage(Message message) {
+        List<DiscordMessage.Attachment> attachments = message.getAttachments().stream()
+                .map(attachment -> new DiscordMessage.Attachment(
+                        attachment.getId(),
+                        attachment.getFileName(),
+                        attachment.getSize(),
+                        attachment.getContentType(),
+                        attachment.getUrl(),
+                        attachment.getProxyUrl()
+                ))
+                .toList();
+        return new DiscordMessage(
+                message.getId(),
+                message.getAuthor().getId(),
+                message.getAuthor().isBot(),
+                message.getContentRaw(),
+                message.getEmbeds().stream().map(DiscordEmbed::fromMessageEmbed).toList(),
+                attachments,
+                message.getTimeCreated()
         );
     }
 

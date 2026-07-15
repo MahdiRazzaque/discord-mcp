@@ -24,6 +24,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.util.EnumSet;
+import java.util.Set;
+
 @Configuration
 public class DiscordMcpConfig {
     @Bean
@@ -68,8 +71,17 @@ public class DiscordMcpConfig {
             System.exit(1);
         }
         return JDABuilder.createDefault(token)
-                .enableIntents(GatewayIntent.GUILD_MEMBERS, GatewayIntent.GUILD_VOICE_STATES, GatewayIntent.SCHEDULED_EVENTS)
+                .enableIntents(gatewayIntents())
                 .build()
                 .awaitReady();
+    }
+
+    static Set<GatewayIntent> gatewayIntents() {
+        return EnumSet.of(
+                GatewayIntent.GUILD_MEMBERS,
+                GatewayIntent.GUILD_VOICE_STATES,
+                GatewayIntent.SCHEDULED_EVENTS,
+                GatewayIntent.MESSAGE_CONTENT
+        );
     }
 }
